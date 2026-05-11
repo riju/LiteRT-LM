@@ -21,6 +21,7 @@ import collections.abc
 import datetime
 import http.server
 import json
+import os
 import re
 import traceback
 from typing import Any, Optional
@@ -37,6 +38,9 @@ STREAM_GEN_CONTENT_RE = re.compile(
 
 _current_engine: Optional[litert_lm.Engine] = None
 _current_model_id: Optional[str] = None
+_current_backend: Optional[litert_lm.Backend] = None
+
+
 
 
 class _ProxyTool(litert_lm.Tool):
@@ -56,8 +60,11 @@ class _ProxyTool(litert_lm.Tool):
     raise NotImplementedError("Proxy tools are not executable.")
 
 
-def get_engine(model_id: str) -> litert_lm.Engine:
-  """Gets or creates the LiteRT-LM engine for the given model ID.
+def get_engine(
+    model_id: str,
+    backend: litert_lm.Backend = None,
+) -> litert_lm.Engine:
+  """Gets or creates the LiteRT-LM engine for the given model ID and backend.
 
   The LiteRT-LM Engine is a globally cached resource. Its lifetime is managed
   manually:
@@ -67,6 +74,7 @@ def get_engine(model_id: str) -> litert_lm.Engine:
 
   Args:
     model_id: The identifier for the model.
+    backend: The backend to use for inference.
 
   Returns:
     The initialized LiteRT-LM Engine.
@@ -74,8 +82,14 @@ def get_engine(model_id: str) -> litert_lm.Engine:
   Raises:
     FileNotFoundError: If the model for the given `model_id` is not found.
   """
-  global _current_engine, _current_model_id
-  if _current_model_id == model_id and _current_engine is not None:
+  if backend is None:
+    backend = litert_lm.Backend.NPU()
+  global _current_engine, _current_model_id, _current_backend
+  if (
+      _current_model_id == model_id
+      and _current_backend == backend
+      and _current_engine is not None
+  ):
     return _current_engine
 
   # If we are switching models or re-initializing, clear the old one first.
@@ -83,19 +97,31 @@ def get_engine(model_id: str) -> litert_lm.Engine:
     _current_engine.__exit__(None, None, None)
     _current_engine = None
     _current_model_id = None
+    _current_backend = None
 
   m = model.Model.from_model_id(model_id)
   if not m.exists():
     raise FileNotFoundError(f"Model {model_id} not found")
 
+  # For NPU, auto-detect native_library_dir from model directory.
+  # LiteRtDispatch.dll and OpenVINO DLLs must be colocated with model.
+  if isinstance(backend, litert_lm.Backend.NPU):
+    model_dir = os.path.dirname(m.model_path)
+    backend = litert_lm.Backend.NPU(native_library_dir=model_dir)
+
   click.echo(
-      click.style(f"Initializing engine for model: {m.model_path}", fg="cyan")
+      click.style(
+          f"Initializing engine for model: {m.model_path} "
+          f"(backend={backend.get_name()})",
+          fg="cyan",
+      )
   )
-  new_engine = litert_lm.Engine(m.model_path, backend=litert_lm.Backend.CPU())
+  new_engine = litert_lm.Engine(m.model_path, backend=backend)
   new_engine.__enter__()
 
   _current_engine = new_engine
   _current_model_id = model_id
+  _current_backend = backend
   return _current_engine
 
 
@@ -175,6 +201,16 @@ def litertlm_to_gemini_response(
 class GeminiHandler(http.server.BaseHTTPRequestHandler):
   """Handler for Gemini API requests."""
 
+  def do_GET(self):  # pylint: disable=invalid-name
+    """Handles GET requests (/health)."""
+    if self.path.split("?")[0] == "/health":
+      self.send_response(200)
+      self.send_header("Content-Type", "text/plain")
+      self.end_headers()
+      self.wfile.write(b"OK")
+    else:
+      self.send_error(404, "Not Found")
+
   # do_POST is the method name expected by http.server.BaseHTTPRequestHandler
   # to handle POST requests.
   def do_POST(self):  # pylint: disable=invalid-name
@@ -189,9 +225,17 @@ class GeminiHandler(http.server.BaseHTTPRequestHandler):
       return
 
     model_spec = match.group(1)
-    # model_spec can be <model_id>[,<backend>][,<max_tokens>]
-    # Support for backend and max_tokens in model_spec is coming soon.
-    model_id = model_spec.split(",")[0]
+    # model_spec can be <model_id>[,<backend>]
+    spec_parts = model_spec.split(",")
+    model_id = spec_parts[0]
+    backend_name = spec_parts[1].lower() if len(spec_parts) > 1 else "npu"
+    if backend_name == "gpu":
+      backend = litert_lm.Backend.GPU()
+    elif backend_name == "cpu":
+      backend = litert_lm.Backend.CPU()
+    else:
+      # Default: NPU. native_library_dir resolved later in get_engine.
+      backend = litert_lm.Backend.NPU()
 
     content_length = int(self.headers.get("Content-Length", 0))
     try:
@@ -204,7 +248,7 @@ class GeminiHandler(http.server.BaseHTTPRequestHandler):
     click.echo(json.dumps(body, indent=2, ensure_ascii=False))
 
     try:
-      engine = get_engine(model_id)
+      engine = get_engine(model_id, backend=backend)
     except FileNotFoundError as e:
       self.send_error(404, str(e))
       return
