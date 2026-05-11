@@ -90,6 +90,19 @@ class LogSeverity(enum.IntEnum):
 _LIB: ctypes.CDLL | None = None
 
 
+def _add_dll_directories() -> None:
+  """On Windows, register DLL search directories from PATH."""
+  import sys
+  if sys.platform != "win32":
+    return
+  for d in os.environ.get("PATH", "").split(os.pathsep):
+    if d and os.path.isdir(d):
+      try:
+        os.add_dll_directory(d)
+      except OSError:
+        pass
+
+
 def _get_lib() -> ctypes.CDLL:
   """Loads and returns the LiteRT-LM C shared library."""
   global _LIB
@@ -99,16 +112,20 @@ def _get_lib() -> ctypes.CDLL:
   import sys
   if sys.platform == "win32":
     lib_name = "litert-lm.dll"
+    _add_dll_directories()
   else:
     extension = "dylib" if sys.platform == "darwin" else "so"
     lib_name = f"liblitert-lm.{extension}"
+
+  # On Windows, use winmode=0 so transitive DLL deps are resolved via PATH.
+  _winmode = {"winmode": 0} if sys.platform == "win32" else {}
 
   # 1. Try loading using importlib.resources (handles .par and package files)
   try:
     ref = resources.files(__package__) / lib_name
     with resources.as_file(ref) as path:
       if path.exists():
-        _LIB = ctypes.CDLL(str(path))
+        _LIB = ctypes.CDLL(str(path), **_winmode)
   except (ImportError, FileNotFoundError, TypeError):
     pass
 
@@ -116,7 +133,7 @@ def _get_lib() -> ctypes.CDLL:
   if _LIB is None:
     path = os.path.join(os.path.dirname(__file__), lib_name)
     if os.path.exists(path):
-      _LIB = ctypes.CDLL(path)
+      _LIB = ctypes.CDLL(path, **_winmode)
 
   if _LIB is None:
     raise RuntimeError(
